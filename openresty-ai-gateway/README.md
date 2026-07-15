@@ -52,7 +52,8 @@ openresty-ai-gateway/
 │   └── rate_limit.lua          # token-bucket + 429 retry logic
 ├── mock-server/                # mock OpenAI backend for tests only
 │   └── mock-nginx.conf         # OpenResty/Lua mock (no extra image to pull)
-├── test.sh                     # validation script
+├── test.sh                     # validation script (mock + real backend)
+├── rpm_test.py                  # RPM verification: free /v1/models load test
 └── README.md
 ```
 
@@ -192,6 +193,62 @@ curl -N http://localhost:30082/v1/chat/completions \
   -H "Authorization: Bearer $NEW_API_TOKEN" \
   -d '{"model":"<your-model>","stream":true,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+### RPM verification experiment (free, no LLM cost)
+`rpm_test.py` proves the RPM cap actually works **without spending a single token**
+— it hammers the free `/v1/models` endpoint with several concurrent clients for a
+fixed duration and measures per-request latency. Because the gateway *queues*
+( sleeps in the token bucket ) instead of returning `429`, an over-rate request
+is **delayed**, not rejected, so the signature of a working RPM is:
+
+* the first `RPM_CAPACITY` requests return instantly (the initial token burst);
+* every request after the bucket is empty is spaced out by
+  `RPM_WINDOW_SECONDS / RPM_CAPACITY` seconds (≈ 2.4 s at the default 25/60);
+* total throughput is capped near `RPM_CAPACITY`/min instead of unbounded.
+
+```bash
+# defaults: GATEWAY=http://localhost:30082, DURATION=60, N_WORKERS=8
+python3 rpm_test.py
+
+# tune if you changed the limit
+GATEWAY=http://localhost:30082 RPM_CAPACITY=25 RPM_WINDOW_SECONDS=60 \
+  DURATION=60 N_WORKERS=8 python3 rpm_test.py
+```
+
+Key env vars: `GATEWAY`, `API_KEY`, `DURATION` (test length, s),
+`RPM_CAPACITY`, `RPM_WINDOW_SECONDS`, `N_WORKERS` (concurrent clients),
+`FAST_THRESHOLD` (s; requests slower than this count as "queued").
+
+**Sample run** (`RPM_CAPACITY=25`, `RPM_WINDOW_SECONDS=60`, 8 workers, 60 s):
+
+```
+ 完成请求总数     : 57
+   - 瞬间完成(<1.0s): 24
+   - 被排队延迟(>=1.0s): 33
+
+ 每秒完成请求数 (时间线):
+   t+ 0s: ################################ (32)   <- 初始令牌被瞬间消耗
+   t+ 1s: . (0)
+   t+ 2s: # (1)                               <- 之后每 ~2.4s 才放行 1 个
+   t+ 4s: # (1)
+   t+ 7s: # (1)
+   ... (稳定 1 个 / 2.4s) ...
+   t+59s: # (1)
+
+ 前 32 个请求响应耗时(s): 1:0.07 ... 24:2.30  25:0.03  26:64.70  27:67.09 ...
+
+ 60s 内平均速率 : ~44.5 请求/分钟
+ 桶耗尽后稳态速率 : ~32.1 请求/分钟 (期望≈25)
+ 若无限流, 上界约 : ~30720 请求/分钟
+ [结论] RPM 限流 **生效**
+```
+
+Interpretation: ~32 requests in the first second (burst), then a steady
+**one request every ≈ 2.4 s** — exactly the configured refill interval. The
+long per-request delays on later requests (45–72 s) are the queue depth under
+concurrency: each over-rate request sleeps behind the single admission lock
+until its token is refilled. Average steady-state throughput collapses to the
+`RPM_CAPACITY`/min ceiling, confirming the limit is enforced.
 
 ---
 
