@@ -1,0 +1,6 @@
+# Secrets — local env file with real credentials. Never commit.
+.env
+
+# Runtime data & logs (host bind-mounts, not source)
+/data/
+/logs/

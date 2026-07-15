@@ -1,0 +1,174 @@
+# =============================================================================
+# New-API deployment stack
+# -----------------------------------------------------------------------------
+# A self-hosted New-API (https://github.com/Calcium-Ion/new-api) instance with:
+#   - PostgreSQL 15  ......... primary datastore
+#   - Redis .................. cache / rate-limit / session store
+#   - new-api ............... the application itself
+#   - Bifrost ............... model aggregation / proxy service
+#   - OpenResty AI Gateway .. reverse proxy + global RPM rate-limiting in front
+#                             of new-api (see ./openresty-ai-gateway/README.md)
+#
+# All services attach to a single EXTERNAL Docker network named `web` (already
+# created on the host). That lets Traefik route to the services and lets the
+# gateway reach new-api simply as `new-api:3000`.
+#
+# Secrets (DB credentials, etc.) are read from environment variables. Copy
+# `.env.example` to `.env` and adjust. `.env` is git-ignored — do NOT commit it.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # new-api — the core application
+  # ---------------------------------------------------------------------------
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: unless-stopped
+    # write application logs into a mounted dir so they persist on the host
+    command: --log-dir /app/logs
+    networks:
+      - web
+    environment:
+      # PostgreSQL DSN — credentials come from .env (POSTGRES_USER/PASSWORD/DB)
+      - SQL_DSN=postgresql://${POSTGRES_USER:-root}:${POSTGRES_PASSWORD:-knogen_is_admin}@new-postgres:5432/${POSTGRES_DB:-new-api}
+      # Redis connection (no auth in this setup)
+      - REDIS_CONN_STRING=${REDIS_CONN_STRING:-redis://new-redis}
+      - TZ=Asia/Shanghai
+      - ERROR_LOG_ENABLED=true
+      - BATCH_UPDATE_ENABLED=true
+    volumes:
+      - ./data:/data            # persistent application data
+      - ./logs:/app/logs        # log files (see ./logs on the host)
+    ports:
+      - "30080:3000"            # host:container — direct access (Traefik also fronts it)
+    depends_on:
+      - new-redis
+      - new-postgres
+    # HTTP health check against /api/status
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Traefik reverse-proxy routing + Watchtower auto-update
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.new_api.rule=Host(`ai-api.quearo.lan.9992099.xyz`)"
+      - "traefik.http.routers.new_api.entrypoints=websecure"
+      - "traefik.http.routers.new_api.tls.certresolver=cloudflare"
+      - "traefik.http.services.new_api.loadbalancer.server.port=3000"
+    # Rotate container logs so the host disk never fills up
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource caps to protect the host
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Redis — cache / rate-limit / session store for new-api
+  # ---------------------------------------------------------------------------
+  new-redis:
+    image: redis:latest
+    container_name: new-api-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - web
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 15 — primary datastore
+  # ---------------------------------------------------------------------------
+  new-postgres:
+    image: postgres:15
+    container_name: new-api-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-knogen_is_admin}
+      POSTGRES_DB: ${POSTGRES_DB:-new-api}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - web
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ---------------------------------------------------------------------------
+  # Bifrost — model aggregation / proxy (https://github.com/maximhq/bifrost)
+  # ---------------------------------------------------------------------------
+  bifrost:
+    image: maximhq/bifrost
+    ports:
+      - "30081:8080"
+    volumes:
+      - /mnt/data/bifrost_data:/app/data   # host path for Bifrost's data
+    restart: always  # 生产环境自动重启，异常退出自动拉起
+    container_name: bifrost-service
+    networks:
+      - web
+
+  # ---------------------------------------------------------------------------
+  # OpenResty AI gateway: reverse proxy in front of new-api with global RPM
+  # rate-limiting (queues instead of 429) and transparent 429 retry.
+  # Code lives in ./openresty-ai-gateway/. Reaches new-api via the shared
+  # `web` network. Published on host port 30082 (container 8080).
+  # ---------------------------------------------------------------------------
+  openresty-ai-gateway:
+    image: openresty/openresty:alpine
+    container_name: openresty-ai-gateway
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    environment:
+      - NEW_API_UPSTREAM=new-api:3000
+      - PORT=8080
+      - RPM_CAPACITY=${RPM_CAPACITY:-25}
+      - RPM_WINDOW_SECONDS=${RPM_WINDOW_SECONDS:-60}
+      - MAX_429_RETRIES=${MAX_429_RETRIES:-5}
+      - RETRY_BACKOFF_SECONDS=${RETRY_BACKOFF_SECONDS:-1}
+    ports:
+      - "${GATEWAY_HOST_PORT:-30082}:8080"
+    volumes:
+      - ./openresty-ai-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./openresty-ai-gateway/lua:/etc/nginx/lua:ro
+      - ./openresty-ai-gateway/docker-entrypoint.sh:/docker-entrypoint.sh:ro
+    networks:
+      - web
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health | grep -q OK || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pg-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  web:
+    external: true   # must already exist on the host: docker network create web

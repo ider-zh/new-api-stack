@@ -1,0 +1,55 @@
+# ===========================================================================
+# Validation compose: gateway + a mock OpenAI-compatible backend.
+#
+# Used to TEST the gateway (RPM queue, SSE streaming, 429 retry) WITHOUT
+# touching the real new-api / LLM provider. Spin it up with:
+#   docker compose -f docker-compose.mock.yml up -d --build
+# Run the tests:
+#   GATEWAY=http://localhost:38080 ./test.sh
+# Tear it down with:
+#   docker compose -f docker-compose.mock.yml down
+# ===========================================================================
+
+services:
+  gateway:
+    image: openresty/openresty:alpine
+    container_name: openresty-ai-gateway-mock
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
+    environment:
+      - NEW_API_UPSTREAM=mock:13000
+      - PORT=8080
+      - RPM_CAPACITY=${RPM_CAPACITY:-25}
+      - RPM_WINDOW_SECONDS=${RPM_WINDOW_SECONDS:-60}
+      - MAX_429_RETRIES=${MAX_429_RETRIES:-5}
+      - RETRY_BACKOFF_SECONDS=${RETRY_BACKOFF_SECONDS:-1}
+    ports:
+      - "38080:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./lua:/etc/nginx/lua:ro
+      - ./docker-entrypoint.sh:/docker-entrypoint.sh:ro
+    networks:
+      - gwtest
+    depends_on:
+      - mock
+
+  mock:
+    # OpenResty-based mock (mock-server/mock-nginx.conf). Uses the already
+    # present openresty image, so no image needs to be pulled.
+    image: openresty/openresty:alpine
+    container_name: mock-backend
+    command: ["openresty", "-c", "/etc/nginx/mock-nginx.conf", "-g", "daemon off;"]
+    environment:
+      # Emit 3 x 429 on the chat endpoint before answering 200, so the
+      # gateway's transparent retry can be observed end-to-end.
+      - MOCK_429_COUNT=${MOCK_429_COUNT:-3}
+      - MOCK_CHUNK_DELAY=0.15
+      - MOCK_CHUNKS=5
+    volumes:
+      - ./mock-server/mock-nginx.conf:/etc/nginx/mock-nginx.conf:ro
+    networks:
+      - gwtest
+
+networks:
+  gwtest:
+    driver: bridge
