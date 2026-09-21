@@ -9,7 +9,7 @@ clients** for local rate limiting — instead it **queues** requests.
 Client / Agent
       |
       v
-OpenResty Gateway   <-- RPM token-bucket, queue, 429 transparent retry
+OpenResty Gateway   <-- RPM + concurrency queue, per-model 429/500/502/503/504 cooldown
       |
       v
 new-api
@@ -27,8 +27,10 @@ LLM Provider
 | HTTP reverse proxy | ✅ |
 | SSE streaming passthrough (real-time, unbuffered) | ✅ |
 | Global RPM limit (token bucket) | ✅ |
+| Configurable global concurrency limit | ✅ |
 | Over-RPM ⇒ queue + wait (no `429`) | ✅ |
-| Transparent retry on upstream `429` | ✅ |
+| Shared per-model cooldown on upstream `429`/`500`/`502`/`503`/`504` | ✅ |
+| Transparent retry on upstream `429`/`500`/`502`/`503`/`504` | ✅ |
 | Docker Compose deployment | ✅ |
 | `/health` endpoint | ✅ |
 | Structured JSON access log (incl. `queue_wait_ms`) | ✅ |
@@ -73,7 +75,10 @@ export PORT=8080
 export GATEWAY_HOST_PORT=30082      # host port the gateway is published on
 export RPM_CAPACITY=25
 export RPM_WINDOW_SECONDS=60
-export MAX_429_RETRIES=5
+export MAX_CONCURRENCY=5
+export HTTP_ERROR_COOLDOWN_SECONDS=5
+export HTTP_ERROR_MAX_COOLDOWN_SECONDS=60
+export MAX_HTTP_ERROR_RETRIES=1
 export RETRY_BACKOFF_SECONDS=1
 
 docker compose up -d
@@ -114,8 +119,13 @@ The refill rate is `RPM_CAPACITY / RPM_WINDOW_SECONDS` tokens per second.
 | `GATEWAY_HOST_PORT` | `30082` | Host port published by compose |
 | `RPM_CAPACITY` | `25` | Token-bucket capacity (= max burst) |
 | `RPM_WINDOW_SECONDS` | `60` | Window for `RPM_CAPACITY` tokens |
-| `MAX_429_RETRIES` | `5` | Max transparent retries on upstream `429` |
-| `RETRY_BACKOFF_SECONDS` | `1` | Base backoff (linear: attempt × base) before each retry |
+| `MAX_CONCURRENCY` | `5` | Maximum requests simultaneously active upstream |
+| `HTTP_ERROR_COOLDOWN_SECONDS` | `5` | Shared delay for the same model after `429`/`500`/`502`/`503`/`504` |
+| `HTTP_ERROR_MAX_COOLDOWN_SECONDS` | `60` | Cap for exponential same-model cooldown |
+| `MAX_HTTP_ERROR_RETRIES` | `1` | Max transparent retries on upstream `429`/`500`/`502`/`503`/`504` |
+| `MAX_429_RETRIES` | `5` | Backward-compatible retry default |
+| `RETRY_BACKOFF_SECONDS` | `1` | Linear per-request retry backoff; cooldown is the minimum |
+| `CONCURRENCY_QUEUE_TIMEOUT_SECONDS` | `3600` | Maximum wait for an upstream concurrency slot |
 
 All values are read **at container start** (port) or **per request** (Lua env
 reads), so nothing is hard-coded.
@@ -123,6 +133,12 @@ reads), so nothing is hard-coded.
 ---
 
 ## How it works
+
+### Concurrency and cold-start admission
+At most `MAX_CONCURRENCY` requests hold an upstream slot. Additional requests
+sleep in OpenResty and are admitted as slots are released, including for SSE
+requests and upstream errors. Consequently a full RPM bucket cannot send all
+of its initial tokens upstream at once after a cold start.
 
 ### RPM (token bucket)
 `lua/rate_limit.lua` keeps `tokens` and `last_refill` in an `ngx.shared.DICT`.
@@ -133,12 +149,13 @@ worker processes, so two workers can never spend the same token.
 * no token → `wait = (1 - tokens) / refill_rate`, `ngx.sleep(wait)`, then
   continue. The client is **queued**, never rejected with `429`.
 
-### 429 transparent retry
-`proxy_intercept_errors on` + `error_page 429 = @retry` intercepts an upstream
-`429`. The `@retry` location increments a per-request counter (keyed by
-`request_id`, stable across internal redirects), sleeps a linear backoff, and
-re-proxies. When the budget is exhausted it delegates to `@passthrough`, which
-has `proxy_intercept_errors off` so the real `429` reaches the client unchanged.
+### Per-model cooldown and transparent retry
+`proxy_intercept_errors on` intercepts initial upstream `429`, `500`, `502`, `503`, and `504`
+responses. The gateway records a shared cooldown keyed by the request's model,
+so newly admitted requests for that same model wait before reaching new-api;
+other models remain independent. The failing request retries within its
+existing concurrency slot using the larger of the shared cooldown and linear
+per-attempt backoff.
 
 ### Streaming
 `proxy_buffering off`, `proxy_cache off`, `proxy_http_version 1.1`,
@@ -175,6 +192,10 @@ docker compose -f docker-compose.mock.yml down
 4. SSE stream arrives progressively (not buffered), ends with `data: [DONE]`
 5. transparent `429` retry: client still gets a full response despite the
    mock's initial `429`s (and gives up with a real `429` once retries exhaust)
+
+`gateway_behavior_test.py` additionally sends concurrent mock requests and
+asserts that cold-start upstream concurrency never exceeds the configured
+limit and that a `503` delays the next queued request for the same model.
 
 The mock (`mock-server/mock-nginx.conf`, served by the already-present
 `openresty/openresty:alpine` image) returns `429` for its first `MOCK_429_COUNT`
@@ -257,8 +278,11 @@ until its token is refilled. Average steady-state throughput collapses to the
 * **Single instance.** State lives in one `ngx.shared.DICT`; multiple gateway
   replicas would each have their own bucket and the RPM limit would multiply.
   Use a sticky/consistent upstream or move to Redis for horizontal scale.
-* **Per-request 429 budget** is keyed by `request_id`; a client that triggers
-  many 429s will eventually receive a real `429` once `MAX_429_RETRIES` is hit.
+* **Single gateway instance.** Concurrency, RPM, and cooldown state are local to
+  one shared-memory zone and are not coordinated across replicas.
+* **Model extraction** reads the JSON body in memory or the first 64 KiB of a
+  buffered body. Requests without a detectable model share the `__global__`
+  cooldown key.
 * **Mid-stream upstream errors** cannot be retried transparently (the SSE
   stream has already started); only *initial* `429`s before any token is sent
   are retried. This matches normal provider behaviour (rate-limit `429`s
@@ -267,3 +291,22 @@ until its token is refilled. Average steady-state throughput collapses to the
   a Lua lock; under sustained overload this serialises admission. This is the
   intended back-pressure, but very high burst rates may need a bigger capacity
   or more workers.
+
+### Retry boundaries and regression tests
+
+The default budget is one additional attempt (two upstream requests total),
+shared across 429, 500, 502, 503 and 504. Persistent failures return the final
+status. Other errors such as 400, 401, 403 and 501 pass through without retry.
+Only errors detected before sending response headers to the client are retried;
+SSE responses are never restarted after output begins. Nginx implicit upstream
+retries are disabled so the Lua budget is the only retry budget.
+
+Run `retry_status_test.py` against the mock compose with `RPM_CAPACITY=1000`,
+`HTTP_ERROR_COOLDOWN_SECONDS=0`, `HTTP_ERROR_MAX_COOLDOWN_SECONDS=0`, and
+`RETRY_BACKOFF_SECONDS=0`. It covers transient recovery, persistent failures,
+nonretryable statuses, preservation of POST/body/authentication, and SSE.
+
+For Dify, point the selected New API model credential's API base URL at
+`http://<gateway-host>:30082/v1`, keeping its API key and model name unchanged.
+Port 30080 bypasses this gateway. This is a runtime credential setting in Dify,
+not a workflow node change; do not commit credentials to this repository.

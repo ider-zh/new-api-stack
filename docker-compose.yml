@@ -128,7 +128,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # OpenResty AI gateway: reverse proxy in front of new-api with global RPM
-  # rate-limiting (queues instead of 429) and transparent 429 retry.
+  # rate-limiting (queues instead of 429) and bounded 429/500/502/503/504 retry.
   # Code lives in ./openresty-ai-gateway/. Reaches new-api via the shared
   # `web` network. Published on host port 30082 (container 8080).
   # ---------------------------------------------------------------------------
@@ -142,6 +142,10 @@ services:
       - PORT=8080
       - RPM_CAPACITY=${RPM_CAPACITY:-25}
       - RPM_WINDOW_SECONDS=${RPM_WINDOW_SECONDS:-60}
+      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-5}
+      - HTTP_ERROR_COOLDOWN_SECONDS=${HTTP_ERROR_COOLDOWN_SECONDS:-5}
+      - HTTP_ERROR_MAX_COOLDOWN_SECONDS=${HTTP_ERROR_MAX_COOLDOWN_SECONDS:-60}
+      - MAX_HTTP_ERROR_RETRIES=${MAX_HTTP_ERROR_RETRIES:-1}
       - MAX_429_RETRIES=${MAX_429_RETRIES:-5}
       - RETRY_BACKOFF_SECONDS=${RETRY_BACKOFF_SECONDS:-1}
     ports:

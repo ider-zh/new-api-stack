@@ -16,6 +16,13 @@ WIN="${RPM_WINDOW_SECONDS:-60}"
 RET="${MAX_429_RETRIES:-5}"
 BACK="${RETRY_BACKOFF_SECONDS:-1}"
 MAXW="${MAX_QUEUE_WAIT_SECONDS:-$WIN}"
+CONC="${MAX_CONCURRENCY:-5}"
+CONCPOLL="${CONCURRENCY_POLL_SECONDS:-0.05}"
+CONCTIMEOUT="${CONCURRENCY_QUEUE_TIMEOUT_SECONDS:-3600}"
+SLOTTTL="${CONCURRENCY_SLOT_TTL_SECONDS:-7200}"
+COOLDOWN="${HTTP_ERROR_COOLDOWN_SECONDS:-5}"
+MAXCOOLDOWN="${HTTP_ERROR_MAX_COOLDOWN_SECONDS:-60}"
+HTTPRET="${MAX_HTTP_ERROR_RETRIES:-1}"
 
 # Write the auto-generated Lua config (do not edit by hand).
 cat > /etc/nginx/gateway_env.lua <<EOF
@@ -24,8 +31,15 @@ return {
     upstream             = "$UP",
     rpm_capacity         = $CAP,
     rpm_window_seconds   = $WIN,
+    max_concurrency      = $CONC,
+    concurrency_poll_seconds = $CONCPOLL,
+    concurrency_queue_timeout_seconds = $CONCTIMEOUT,
+    concurrency_slot_ttl_seconds = $SLOTTTL,
     max_429_retries      = $RET,
+    max_http_error_retries = $HTTPRET,
     retry_backoff_seconds = $BACK,
+    http_error_cooldown_seconds = $COOLDOWN,
+    http_error_max_cooldown_seconds = $MAXCOOLDOWN,
     max_queue_wait_seconds = $MAXW,
 }
 EOF

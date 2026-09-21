@@ -20,6 +20,10 @@ services:
       - PORT=8080
       - RPM_CAPACITY=${RPM_CAPACITY:-25}
       - RPM_WINDOW_SECONDS=${RPM_WINDOW_SECONDS:-60}
+      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-5}
+      - HTTP_ERROR_COOLDOWN_SECONDS=${HTTP_ERROR_COOLDOWN_SECONDS:-2}
+      - HTTP_ERROR_MAX_COOLDOWN_SECONDS=${HTTP_ERROR_MAX_COOLDOWN_SECONDS:-8}
+      - MAX_HTTP_ERROR_RETRIES=${MAX_HTTP_ERROR_RETRIES:-1}
       - MAX_429_RETRIES=${MAX_429_RETRIES:-5}
       - RETRY_BACKOFF_SECONDS=${RETRY_BACKOFF_SECONDS:-1}
     ports:
@@ -38,13 +42,16 @@ services:
     # present openresty image, so no image needs to be pulled.
     image: openresty/openresty:alpine
     container_name: mock-backend
+    ports:
+      - "38081:13000"
     command: ["openresty", "-c", "/etc/nginx/mock-nginx.conf", "-g", "daemon off;"]
     environment:
-      # Emit 3 x 429 on the chat endpoint before answering 200, so the
-      # gateway's transparent retry can be observed end-to-end.
-      - MOCK_429_COUNT=${MOCK_429_COUNT:-3}
+      # One transparent retry is enough to prove the behavior without
+      # multiplying requests during a persistent provider incident.
+      - MOCK_429_COUNT=${MOCK_429_COUNT:-1}
       - MOCK_CHUNK_DELAY=0.15
       - MOCK_CHUNKS=5
+      - MOCK_RESPONSE_DELAY=${MOCK_RESPONSE_DELAY:-0.5}
     volumes:
       - ./mock-server/mock-nginx.conf:/etc/nginx/mock-nginx.conf:ro
     networks:
