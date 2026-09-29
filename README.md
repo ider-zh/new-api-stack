@@ -80,6 +80,10 @@ Secrets and tunables live in a `.env` file (git-ignored). Copy
 | `REDIS_CONN_STRING`     | `redis://new-redis` | new-api         | Redis connection string                  |
 | `RPM_CAPACITY`          | `25`             | gateway            | Token-bucket capacity (= max burst/min)  |
 | `RPM_WINDOW_SECONDS`    | `60`             | gateway            | Refill window for `RPM_CAPACITY` tokens  |
+| `MAX_CONCURRENCY`       | `5`              | gateway            | Maximum simultaneous upstream requests  |
+| `HTTP_ERROR_COOLDOWN_SECONDS` | `5`        | gateway            | Same-model delay after upstream 429/500/502/503/504  |
+| `HTTP_ERROR_MAX_COOLDOWN_SECONDS` | `60`   | gateway            | Maximum exponential same-model delay     |
+| `MAX_HTTP_ERROR_RETRIES` | `1`             | gateway            | Transparent retries for upstream 429/500/502/503/504 |
 | `MAX_429_RETRIES`       | `5`              | gateway            | Transparent retries on upstream `429`    |
 | `RETRY_BACKOFF_SECONDS` | `1`              | gateway            | Base backoff (linear) between retries    |
 | `GATEWAY_HOST_PORT`     | `30082`          | gateway            | Host port the gateway is published on    |

@@ -136,7 +136,7 @@ TMP_429=$(mktemp)
 HTTP_CODE=$(curl -s -o "$TMP_429" -w '%{http_code}' -N -X POST \
   "$GATEWAY/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"mock-model","stream":true,"messages":[{"role":"user","content":"retry"}]}')
+  -d '{"model":"retry-model","stream":true,"messages":[{"role":"user","content":"retry"}]}')
 if [ "$HTTP_CODE" = "200" ] && grep -q 'data: \[DONE\]' "$TMP_429"; then
   ok "transparent retry succeeded: client got 200 + data: [DONE] despite upstream 429s"
 else

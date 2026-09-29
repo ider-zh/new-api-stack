@@ -53,12 +53,41 @@ _M.rpm_capacity = tonumber(opt("rpm_capacity", 25))
 -- refill rate = capacity / window_seconds  (tokens per second).
 _M.rpm_window_seconds = tonumber(opt("rpm_window_seconds", 60))
 
+-- Maximum requests actively proxied upstream. Waiting clients do not consume
+-- an upstream slot, preventing a full RPM bucket from becoming a cold-start
+-- burst of simultaneous model calls.
+_M.max_concurrency = math.max(1, math.floor(
+    tonumber(opt("max_concurrency", 5)) or 5
+))
+_M.concurrency_poll_seconds = math.max(
+    0.01, tonumber(opt("concurrency_poll_seconds", 0.05)) or 0.05
+)
+_M.concurrency_queue_timeout_seconds = math.max(
+    1, tonumber(opt("concurrency_queue_timeout_seconds", 3600)) or 3600
+)
+_M.concurrency_slot_ttl_seconds = math.max(
+    _M.concurrency_queue_timeout_seconds,
+    tonumber(opt("concurrency_slot_ttl_seconds", 7200)) or 7200
+)
+
 -- Maximum transparent retries when the upstream answers with HTTP 429.
 _M.max_429_retries = tonumber(opt("max_429_retries", 5))
 
 -- Base backoff (seconds) applied before each 429 retry.
 -- The actual sleep grows linearly: attempt * backoff_seconds.
 _M.retry_backoff_seconds = tonumber(opt("retry_backoff_seconds", 1))
+
+-- An upstream 429/500/502/503/504 pauses newly admitted requests for the same model.
+_M.http_error_cooldown_seconds = math.max(
+    0, tonumber(opt("http_error_cooldown_seconds", 5)) or 5
+)
+_M.http_error_max_cooldown_seconds = math.max(
+    _M.http_error_cooldown_seconds,
+    tonumber(opt("http_error_max_cooldown_seconds", 60)) or 60
+)
+_M.max_http_error_retries = math.max(0, math.floor(
+    tonumber(opt("max_http_error_retries", 1)) or 1
+))
 
 -- Hard upper bound (seconds) for a single queued request, so a pathological
 -- backlog cannot block a worker forever. Roughly the time to fully refill.
